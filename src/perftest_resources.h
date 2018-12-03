@@ -193,6 +193,7 @@ struct pingpong_context {
 	int					tx_depth;
 	int					huge_shmid;
 	uint64_t				*scnt;
+	uint64_t				*stot;
 	uint64_t				*ccnt;
 	int					is_contig_supported;
 	uint32_t				*r_dctn;

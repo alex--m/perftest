@@ -873,7 +873,7 @@ struct ibv_device* ctx_find_dev(char **ib_devname)
 void alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_param)
 {
 	uint64_t tarr_size;
-	int num_of_qps_factor;
+	int i, num_of_qps_factor;
 	ctx->cycle_buffer = user_param->cycle_buffer;
 	ctx->cache_line_size = user_param->cache_line_size;
 
@@ -903,9 +903,11 @@ void alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_par
 		ALLOCATE(ctx->my_addr,uint64_t,user_param->num_of_qps);
 		ALLOCATE(ctx->rem_addr,uint64_t,user_param->num_of_qps);
 		ALLOCATE(ctx->scnt,uint64_t,user_param->num_of_qps);
+		ALLOCATE(ctx->stot,uint64_t,user_param->num_of_qps);
 		ALLOCATE(ctx->ccnt,uint64_t,user_param->num_of_qps);
 		memset(ctx->scnt, 0, user_param->num_of_qps * sizeof (uint64_t));
 		memset(ctx->ccnt, 0, user_param->num_of_qps * sizeof (uint64_t));
+		for (i = 0; i < user_param->num_of_qps; i++) ctx->stot[i] = user_param->iters;
 
 	} else if ((user_param->tst == BW || user_param->tst == LAT_BY_BW)
 		   && user_param->verb == SEND && user_param->machine == SERVER) {
@@ -1155,6 +1157,7 @@ int destroy_ctx(struct pingpong_context *ctx,
 		free(ctx->my_addr);
 		free(ctx->rem_addr);
 		free(ctx->scnt);
+		free(ctx->stot);
 		free(ctx->ccnt);
 	}
 	else if ((user_param->tst == BW || user_param->tst == LAT_BY_BW ) && user_param->verb == SEND && user_param->machine == SERVER) {
@@ -2799,6 +2802,82 @@ cleaning:
 }
 
 /******************************************************************************
+ * multipath_rebalance() maintains the balance of bandwidth across multiple
+ * QPs. This means if one QP is more congested than another (established based
+ * on the ECN counter values), the more congested QP will send less traffic and
+ * the less congested will send more (total remains the same).
+ *
+ * The main issue with this approach is that counters are per-port, not per-QP.
+ * It's not a logical limitation but a technical one: ECN is only exported to
+ * the user (via sysfs) on a per-port basis, assuming all the traffic should
+ * be handled collectively. We had to use the rate of the ECN's change (first
+ * derivative) to find if our change is positive or negative.
+ *
+ *
+ * Problem: why is ECN better than counting how many were sent successfully on each QP?
+ * BW test sends max-capacity across all QPs anyway!!!
+ *
+ * Possible solution: make nicer apps, that don't impact the network!!!
+ *
+ * We thought of two ways to avoid this limitation:
+ * 1.
+ * 2. Separate SLs/VLs
+ ******************************************************************************/
+cycles_t last_cycles = 0;
+counter_t last_ecn_value = 0;
+int last_incremented_index = 0;
+#define MP_REBALANCE_INTERVAL (1000) // TODO: set...
+
+static inline int multipath_rebalance(struct counter_context *ctx,
+		cycles_t now, uint64_t sent_count[],
+		uint64_t total_to_be_sent[], unsigned num_of_qps)
+{
+	if (now - last_cycles < MP_REBALANCE_INTERVAL) {
+		last_cycles = now;
+		return 0;
+	}
+
+	last_timestamp = now;
+	last_ecn_value = ctx->counters[0];
+	counters->read(ctx); /* sample the counter */
+	counter_t ecn_value = ctx->counters[0];
+
+	/* Use ECN to decide how to send packets */
+	int has_improved = last_ecn_value - ecn_value;
+	int tried_incrementing = (last_incremented_index != -1);
+	if (tried_incrementing) {
+		if (has_improved) {
+			last_incremented_value *= 2; /* Note: can be negative! */
+		} else {
+			last_incremented_value = -1;
+		}
+	} else {
+		last_incremented_index = rand_r(&ctx->random_seed);
+		last_incremented_value = 1;
+	}
+
+	/* Increment by using the selected path index and value */
+	ctx->ratio[last_incremented_index] += last_incremented_value;
+	if (ctx->ratio[last_incremented_index] > MAX_RATIO) {
+		/* Normalize the values - divide all by two */
+		int i;
+		for (i = 0; i < num_connections; i++) {
+			ctx->ratio[i] >>= 1;
+		}
+	}
+
+	/* If we reached the peak - try a new path to balance */
+	if (last_incremented_value < 0) {
+		last_incremented_index = -1;
+	}
+
+	/* store values for the next time we rebalance */
+	memcpy(&last_ecn_change, &ecn_change, sizeof(ecn_change));
+	memcpy(&last_ecn_value, &ecn_value, sizeof(ecn_change));
+	return 0;
+}
+
+/******************************************************************************
  *
  ******************************************************************************/
 int perform_warm_up(struct pingpong_context *ctx,struct perftest_parameters *user_param)
@@ -3060,10 +3139,12 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 						ctx->ccnt[wc_id] += user_param->cq_mod;
 						totccnt += user_param->cq_mod;
 						if (user_param->noPeak == OFF) {
-							if (totccnt > tot_iters)
-								user_param->tcompleted[user_param->iters*num_of_qps - 1] = get_cycles();
+							cycles_t cycles = get_cycles();
+							if (totccnt >=  tot_iters - 1)
+								user_param->tcompleted[user_param->iters*num_of_qps - 1] = cycles;
 							else
-								user_param->tcompleted[totccnt-1] = get_cycles();
+								user_param->tcompleted[totccnt-1] = cycles;
+							multipath_rebalance(user_param->counter_ctx, cycles, ctx->scnt, ctx->stot, user_param->num_of_qps);
 						}
 
 						if (user_param->test_type==DURATION && user_param->state == SAMPLE_STATE) {
@@ -3610,7 +3691,6 @@ int run_iter_bi(struct pingpong_context *ctx,
 	uint64_t 		*unused_recv_for_qp = NULL;
 	uint64_t		*posted_per_qp = NULL;
 	uint64_t 		tot_iters = 0;
-	uint64_t 		iters = 0;
 	int 			tot_scredit = 0;
 	int 			*scredit_for_qp = NULL;
 	struct ibv_wc 		*wc = NULL;
@@ -3677,15 +3757,14 @@ int run_iter_bi(struct pingpong_context *ctx,
 		num_of_qps /= 2;
 
 	tot_iters = (uint64_t)user_param->iters*num_of_qps;
-	iters=user_param->iters;
 	check_alive_data.g_total_iters = tot_iters;
 
 	while ((user_param->test_type == DURATION && user_param->state != END_STATE) ||
 							totccnt < tot_iters || totrcnt < tot_iters ) {
 
 		for (index=0; index < num_of_qps; index++) {
-			while (before_first_rx == OFF && (ctx->scnt[index] < iters || user_param->test_type == DURATION) &&
-					((ctx->scnt[index] + scredit_for_qp[index] - ctx->ccnt[index] + user_param->post_list) <= user_param->tx_depth)) {
+			while (before_first_rx == OFF && (ctx->scnt[index] < ctx->stot[index] || user_param->test_type == DURATION) &&
+					((ctx->scnt[index] + scredit_for_qp[index] - ctx->ccnt[index] + user_param->post_list) < user_param->tx_depth)) {
 				if (ctx->send_rcredit) {
 					uint32_t swindow = ctx->scnt[index] + user_param->post_list - ctx->credit_buf[index];
 					if (swindow >= user_param->rx_depth)
@@ -3827,10 +3906,12 @@ int run_iter_bi(struct pingpong_context *ctx,
 									ctx->ccnt[(int)credit_wc.wr_id] += user_param->cq_mod;
 
 									if (user_param->noPeak == OFF) {
+										cycles_t cycles = get_cycles();
 										if ((user_param->test_type == ITERATIONS && (totccnt > tot_iters)))
-											user_param->tcompleted[tot_iters - 1] = get_cycles();
+											user_param->tcompleted[tot_iters - 1] = cycles;
 										else
-											user_param->tcompleted[totccnt-1] = get_cycles();
+											user_param->tcompleted[totccnt-1] = cycles;
+										multipath_rebalance(user_param->counter_ctx, cycles, ctx->scnt, ctx->stot, user_param->num_of_qps);
 									}
 									if (user_param->test_type==DURATION && user_param->state == SAMPLE_STATE)
 										user_param->iters += user_param->cq_mod;
@@ -3888,11 +3969,12 @@ int run_iter_bi(struct pingpong_context *ctx,
 					ctx->ccnt[(int)wc_tx[i].wr_id] += user_param->cq_mod;
 
 					if (user_param->noPeak == OFF) {
-
+						cycles_t cycles = get_cycles();
 						if ((user_param->test_type == ITERATIONS && (totccnt > tot_iters)))
-							user_param->tcompleted[tot_iters - 1] = get_cycles();
+							user_param->tcompleted[tot_iters - 1] = cycles;
 						else
-							user_param->tcompleted[totccnt-1] = get_cycles();
+							user_param->tcompleted[totccnt-1] = cycles;
+						multipath_rebalance(user_param->counter_ctx, cycles, ctx->scnt, ctx->stot, user_param->num_of_qps);
 					}
 
 					if (user_param->test_type==DURATION && user_param->state == SAMPLE_STATE) {
@@ -3903,7 +3985,6 @@ int run_iter_bi(struct pingpong_context *ctx,
 					}
 				}
 			}
-
 		} else if (ne < 0) {
 			fprintf(stderr, "poll CQ failed %d\n", ne);
 			return_value = FAILURE;
